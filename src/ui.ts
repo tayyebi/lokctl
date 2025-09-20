@@ -1,619 +1,454 @@
 import blessed from 'blessed';
-import contrib from 'blessed-contrib';
-import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
 import { fetchLogs, fetchContext, writeLog, LokiLogEntry } from './lokiClient.js';
 import { config } from './config.js';
 
+type MenuItem = {
+  label: string;
+  action?: () => void | Promise<void>;
+  submenu?: MenuItem[];
+};
+
 export function startUI() {
-  const screen = blessed.screen({
-    smartCSR: true,
-    title: 'Lokctl - Loki Log Viewer'
-  });
+  const screen = blessed.screen({ smartCSR: true, title: 'lokctl' });
 
-  // Header
+  // header
   const header = blessed.box({
-    top: 0,
+    top: 1,
     left: 0,
     right: 0,
-    height: 3,
-    border: 'line',
-    style: {
-      fg: 'white',
-      bg: 'blue',
-      border: {
-        fg: 'cyan'
-      }
-    },
-    content: `
-${chalk.bold.cyan('🔍 Lokctl')} - Loki Log Viewer
-${chalk.gray('Query:')} {job=~".+"} ${chalk.gray('|')} ${chalk.gray('Server:')} ${config.lokiUrl}
-${chalk.gray('Press')} ${chalk.white.bold('?')} ${chalk.gray('for help')} ${chalk.gray('|')} ${chalk.gray('Press')} ${chalk.white.bold('w')} ${chalk.gray('to write logs')}`
+    height: 2,
+    tags: true,
+    style: { bg: 'black', fg: 'white' }
   });
 
-  // Logs panel (left side)
-  const logBox = blessed.list({
+  // logs and context
+  const logsBox = blessed.list({
     top: 3,
     left: 0,
     width: '50%',
     height: '100%-4',
-    border: 'line',
-    label: ' Logs ',
     keys: true,
     vi: true,
     mouse: true,
+    tags: true,
+    label: ' logs ',
+    border: 'line',
     style: {
-      fg: 'white',
-      bg: 'black',
-      border: {
-        fg: 'green'
-      },
-      selected: {
-        fg: 'black',
-        bg: 'green'
-      },
-      item: {
-        fg: 'white'
-      }
-    },
-    tags: true
+      border: { fg: 'green' },
+      selected: { bg: 'green', fg: 'black' }
+    }
   });
 
-  // Context panel (right side)
-  const contextBox = blessed.list({
+  const ctxBox = blessed.list({
     top: 3,
     right: 0,
     width: '50%',
     height: '100%-4',
-    border: 'line',
-    label: ' Context ',
     keys: true,
     vi: true,
     mouse: true,
+    tags: true,
+    label: ' context ',
+    border: 'line',
     style: {
-      fg: 'white',
-      bg: 'black',
-      border: {
-        fg: 'cyan'
-      },
-      selected: {
-        fg: 'black',
-        bg: 'cyan'
-      },
-      item: {
-        fg: 'white'
-      }
-    },
-    tags: true
+      border: { fg: 'cyan' },
+      selected: { bg: 'cyan', fg: 'black' }
+    }
   });
 
-  // Status bar
+  // status
   const statusBar = blessed.box({
     bottom: 0,
     left: 0,
     right: 0,
     height: 1,
-    style: {
-      fg: 'white',
-      bg: 'blue'
-    }
+    tags: true,
+    style: { bg: 'blue', fg: 'white' }
   });
 
-  // Help panel (hidden by default)
-  const helpPanel = blessed.box({
-    top: 'center',
-    left: 'center',
-    width: '80%',
-    height: '70%',
-    border: 'line',
-    label: ' Help ',
-    keys: true,
+  // menu model
+  const menus: MenuItem[] = [
+    {
+      label: 'file',
+      submenu: [
+        { label: 'refresh', action: loadLogs },
+        { label: 'export', action: exportLogs },
+        { label: 'quit', action: () => { screen.destroy(); process.exit(0); } }
+      ]
+    },
+    {
+      label: 'view',
+      submenu: [
+        { label: 'context for selected', action: () => loadContextForIndex((logsBox as any).selected || 0) },
+        { label: 'detail for selected', action: () => viewDetail((logsBox as any).selected || 0) }
+      ]
+    },
+    {
+      label: 'actions',
+      submenu: [
+        { label: 'write log', action: writeLogFlow }
+      ]
+    },
+    {
+      label: 'query',
+      submenu: [
+        {
+          label: 'set query',
+          action: async () => {
+            const q = await prompt('logql query', currentQuery);
+            if (q !== null) {
+              currentQuery = q.trim() || currentQuery;
+              await loadLogs();
+            }
+          }
+        }
+      ]
+    },
+    {
+      label: 'search',
+      submenu: [
+        {
+          label: 'set search term',
+          action: async () => {
+            const term = await prompt('search term (highlight only)', searchTerm);
+            if (term !== null) {
+              searchTerm = term.trim();
+              renderLogs(currentLogs);
+              setStatus(searchTerm ? `highlighting "${searchTerm}"` : 'cleared highlights');
+            }
+          }
+        },
+        { label: 'clear highlight', action: () => { searchTerm = ''; renderLogs(currentLogs); setStatus('cleared highlights'); } }
+      ]
+    },
+    {
+      label: 'help',
+      submenu: [
+        {
+          label: 'keybindings',
+          action: () => {
+            messageBox(
+              'help',
+`{bold}menus:{/bold} tab/shift+tab to move; enter to open; esc to close
+{bold}navigation:{/bold} arrows or vi; page up/down
+{bold}actions:{/bold} refresh, export, write log, context, detail
+{bold}shortcuts:{/bold}
+  c: load context for selected
+  v: view detail for selected
+  r: refresh logs
+  /: set search term
+  q or ctrl+c: quit`
+            );
+          }
+        }
+      ]
+    }
+  ];
+
+  // listbar requires 'items' and sometimes 'commands' in @types/blessed; we provide both
+  const topLabels = menus.map(m => m.label);
+  const menuCommands = topLabels.map((label) => ({
+    text: label,
+    key: label[0], // single-char accelerator
+    callback: () => {
+      const m = menus.find(x => x.label === label);
+      if (m?.submenu) showSubmenu(m.label, m.submenu);
+    }
+  }));
+
+  const menuBar = blessed.listbar({
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 1,
     mouse: true,
-    hidden: true,
-    scrollable: true,
-    alwaysScroll: true,
+    keys: true,
+    autoCommandKeys: true,
     style: {
-      fg: 'white',
-      bg: 'black',
-      border: {
-        fg: 'cyan'
-      }
-    }
+      bg: 'blue',
+      item: { bg: 'blue', fg: 'white' },
+      selected: { bg: 'cyan', fg: 'black' }
+    },
+    // both provided to satisfy different typings across versions
+    items: menuCommands as any,
+    commands: menuCommands as any
   });
 
-  const helpContent = blessed.text({
-    parent: helpPanel,
-    top: 1,
-    left: 1,
-    right: 1,
-    content: `
-${chalk.bold.cyan('Lokctl - Loki Log Viewer')}
+  // append
+  screen.append(menuBar);
+  screen.append(header);
+  screen.append(logsBox);
+  screen.append(ctxBox);
+  screen.append(statusBar);
 
-${chalk.bold.yellow('Navigation:')}
-  ${chalk.white('j/k')}     - Move up/down
-  ${chalk.white('g/G')}     - Go to top/bottom
-  ${chalk.white('↑/↓')}     - Move up/down
-  ${chalk.white('Page Up/Down')} - Page up/down
-
-${chalk.bold.yellow('Actions:')}
-  ${chalk.white('c')}       - Show context for selected log
-  ${chalk.white('v')}       - View full log detail
-  ${chalk.white('w')}       - Write new log entry
-  ${chalk.white('e')}       - Export logs to file
-  ${chalk.white('r')}       - Refresh current query
-  ${chalk.white('/')}       - Search mode
-
-${chalk.bold.yellow('Search & Filter:')}
-  ${chalk.white('/term')}   - Search and highlight terms
-  ${chalk.white('Enter')}   - Apply LogQL filter
-  ${chalk.white('Esc')}     - Clear search/filter
-
-${chalk.bold.yellow('Mouse:')}
-  ${chalk.white('Click')}   - Select log and show context
-  ${chalk.white('Double-click')} - View full log detail
-
-${chalk.bold.yellow('General:')}
-  ${chalk.white('?')}       - Show/hide this help
-  ${chalk.white('q')}       - Quit application
-  ${chalk.white('Ctrl+C')}  - Quit application
-
-${chalk.bold.yellow('LogQL Examples:')}
-  ${chalk.gray('{job="myapp"}')}                    - Filter by job
-  ${chalk.gray('{level="error"}')}                  - Filter by level
-  ${chalk.gray('{job="api",level="error"}')}        - Multiple filters
-  ${chalk.gray('{job=~".*api.*"}')}                 - Regex matching
-  ${chalk.gray('{job="myapp"} |= "error"')}         - Text search
-`
-  });
-
-  helpPanel.key(['escape', 'q', '?'], () => {
-    helpPanel.hide();
-    screen.render();
-  });
-
-  let currentQuery = config.defaultQuery;
+  // state
+  let currentQuery = config.defaultQuery || '{job=~".+"}';
   let currentLogs: LokiLogEntry[] = [];
   let searchTerm = '';
-  let searchMode = false;
 
-  // Update status bar
-  function updateStatus(message: string) {
-    statusBar.setContent(` ${message}`);
+  // utils
+  const setStatus = (msg: string) => {
+    statusBar.setContent(` ${msg}`);
     screen.render();
-  }
-
-  // Update header with current query
-  function updateHeader(query: string) {
-    header.setContent(`
-${chalk.bold.cyan('🔍 Lokctl')} - Loki Log Viewer
-${chalk.gray('Query:')} ${query} ${chalk.gray('|')} ${chalk.gray('Server:')} ${config.lokiUrl}
-${chalk.gray('Press')} ${chalk.white.bold('?')} ${chalk.gray('for help')} ${chalk.gray('|')} ${chalk.gray('Press')} ${chalk.white.bold('w')} ${chalk.gray('to write logs')}`);
-    screen.render();
-  }
-
-  // Global key handlers
-  screen.key(['escape', 'q', 'C-c'], () => {
-    screen.destroy();
-    process.exit(0);
-  });
-
-  screen.key(['?'], () => {
-    helpPanel.toggle();
-    screen.render();
-  });
-
-  screen.key(['/'], () => {
-    searchMode = true;
-    updateStatus('Search mode: Type search term and press Enter');
-  });
-
-  // Navigation keys
-  screen.key(['j', 'down'], () => {
-    logBox.down(1);
-    screen.render();
-  });
-
-  screen.key(['k', 'up'], () => {
-    logBox.up(1);
-    screen.render();
-  });
-
-  screen.key(['g'], () => {
-    logBox.select(0);
-    screen.render();
-  });
-
-  screen.key(['G'], () => {
-    logBox.select(currentLogs.length - 1);
-    screen.render();
-  });
-
-  screen.key(['pageup'], () => {
-    for (let i = 0; i < 10; i++) {
-      logBox.up(1);
-    }
-    screen.render();
-  });
-
-  screen.key(['pagedown'], () => {
-    for (let i = 0; i < 10; i++) {
-      logBox.down(1);
-    }
-    screen.render();
-  });
-
-  screen.key(['r'], () => {
-    updateStatus('Refreshing logs...');
-    loadLogs(currentQuery);
-  });
-
-  screen.key(['w'], () => {
-    showWriteLogForm();
-  });
-
-  screen.key(['e'], () => {
-    const filePath = path.join(process.cwd(), `lokctl-logs-${Date.now()}.log`);
-    const content = currentLogs.map(l => `${l.timestamp} ${l.line}`).join('\n');
-    fs.writeFileSync(filePath, content, 'utf8');
-    updateStatus(`Logs exported to ${filePath}`);
-  });
-
-  const loadContext = async (idx: number) => {
-    const selected = currentLogs[idx];
-    if (!selected) return;
-    updateStatus(`Loading context for ${selected.timestamp}...`);
-    const contextLogs = await fetchContext(currentQuery, Date.parse(selected.timestamp) * 1_000_000 + '');
-    renderContext(contextLogs, searchTerm);
-    updateStatus(`Context loaded: ${contextLogs.length} entries`);
   };
 
-  logBox.on('select', (item: any, index: number) => {
-    loadContext(index);
-  });
+  const setHeader = () => {
+    header.setContent(
+      ` {bold}query:{/bold} ${currentQuery}  {bold}|{/bold}  {bold}server:{/bold} ${config.lokiUrl}`
+    );
+  };
 
-  logBox.on('click', () => {
-    const idx = (logBox as any).selected || 0;
-    loadContext(idx);
-  });
+  const highlight = (text: string, term: string) => {
+    if (!term) return text;
+    const esc = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return text.replace(
+      new RegExp(`(${esc})`, 'gi'),
+      '{black-bg}{yellow-fg}$1{/yellow-fg}{/black-bg}'
+    );
+  };
 
-  logBox.on('doubleclick', () => {
-    const idx = (logBox as any).selected || 0;
-    const selected = currentLogs[idx];
-    if (!selected) return;
-    showLogDetail(selected);
-  });
+  const colorByLevel = (line: string) => {
+    const lc = line.toLowerCase();
+    if (lc.includes('error')) return `{red-fg}${line}{/red-fg}`;
+    if (lc.includes('warn')) return `{yellow-fg}${line}{/yellow-fg}`;
+    if (lc.includes('debug')) return `{gray-fg}${line}{/gray-fg}`;
+    return line;
+  };
 
-  screen.key(['c'], () => {
-    const idx = (logBox as any).selected || 0;
-    loadContext(idx);
-  });
+  const renderLogs = (logs: LokiLogEntry[]) => {
+    logsBox.clearItems();
+    if (!logs.length) {
+      logsBox.addItem('{gray-fg}(no logs){/gray-fg}');
+    } else {
+      for (const l of logs) {
+        const t = new Date(l.timestamp).toLocaleTimeString();
+        let line = `{bold}${t}{/bold} ${l.line}`;
+        line = highlight(line, searchTerm);
+        line = colorByLevel(line);
+        logsBox.addItem(line);
+      }
+    }
+    logsBox.select(0);
+    screen.render();
+  };
 
-  screen.key(['v'], () => {
-    const idx = (logBox as any).selected || 0;
-    const selected = currentLogs[idx];
-    if (!selected) return;
-    showLogDetail(selected);
-  });
+  const renderContext = (logs: LokiLogEntry[]) => {
+    ctxBox.clearItems();
+    if (!logs.length) {
+      ctxBox.addItem('{gray-fg}(no context){/gray-fg}');
+    } else {
+      for (const l of logs) {
+        const t = new Date(l.timestamp).toLocaleTimeString();
+        let line = `{bold}${t}{/bold} ${l.line}`;
+        line = highlight(line, searchTerm);
+        line = colorByLevel(line);
+        ctxBox.addItem(line);
+      }
+    }
+    ctxBox.select(0);
+    screen.render();
+  };
 
-  function showLogDetail(log: LokiLogEntry) {
-    const logDetail = blessed.box({
+  const prompt = (label: string, initial = ''): Promise<string | null> => {
+    return new Promise(resolve => {
+      const form = blessed.form({
+        parent: screen,
+        top: 'center',
+        left: 'center',
+        width: '60%',
+        height: 5,
+        border: 'line',
+        label,
+        keys: true,
+        mouse: true,
+        style: { border: { fg: 'cyan' } }
+      });
+      const tb = blessed.textbox({
+        parent: form,
+        top: 1,
+        left: 1,
+        right: 1,
+        height: 1,
+        inputOnFocus: true,
+        value: initial,
+        border: 'line',
+        style: { border: { fg: 'green' } }
+      });
+      form.key(['escape'], () => {
+        screen.remove(form);
+        screen.render();
+        resolve(null);
+      });
+      tb.key(['enter'], () => {
+        const v = tb.getValue();
+        screen.remove(form);
+        screen.render();
+        resolve(v);
+      });
+      tb.focus();
+      screen.render();
+    });
+  };
+
+  const messageBox = (title: string, content: string) => {
+    const box = blessed.box({
       parent: screen,
       top: 'center',
       left: 'center',
-      width: '80%',
+      width: '70%',
       height: '60%',
       border: 'line',
-      label: ' Log Detail ',
+      label: ` ${title} `,
+      tags: true,
       keys: true,
       mouse: true,
       scrollable: true,
       alwaysScroll: true,
-      style: {
-        fg: 'white',
-        bg: 'black',
-        border: {
-          fg: 'cyan'
-        }
-      }
+      style: { border: { fg: 'cyan' } },
+      content
     });
-
-    const content = blessed.text({
-      parent: logDetail,
-      top: 1,
-      left: 1,
-      right: 1,
-      content: `${chalk.bold.cyan('Timestamp:')} ${log.timestamp}
-
-${chalk.bold.yellow('Log Content:')}
-${log.line}
-
-${chalk.gray('Press Escape, q, Enter, or Space to close')}`,
-      tags: true
-    });
-
-    logDetail.key(['escape', 'q', 'enter', 'space'], () => {
-      screen.remove(logDetail);
+    box.key(['escape', 'q', 'enter', 'space'], () => {
+      screen.remove(box);
       screen.render();
     });
-
-    logDetail.focus();
+    box.focus();
     screen.render();
-  }
+  };
 
-  async function loadLogs(query: string) {
+  // data ops
+  async function loadLogs() {
+    setHeader();
+    setStatus('loading logs…');
     try {
-      updateStatus('Loading logs...');
-      updateHeader(query);
-      currentLogs = await fetchLogs(query);
-      renderLogs(currentLogs, searchTerm);
-      contextBox.clearItems();
-      updateStatus(`Loaded ${currentLogs.length} log entries`);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      updateStatus(`Error: ${errorMessage}`);
+      const logs = await fetchLogs(currentQuery);
+      currentLogs = logs;
+      renderLogs(currentLogs);
+      ctxBox.clearItems();
+      ctxBox.addItem('{gray-fg}(select a log to load context){/gray-fg}');
+      setStatus(`loaded ${currentLogs.length} log entries`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      renderLogs([]);
+      ctxBox.clearItems();
+      setStatus(`error: ${msg}`);
     }
   }
 
-  function renderLogs(logs: LokiLogEntry[], highlight: string) {
-    logBox.clearItems();
-    logs.forEach((log, index) => {
-      const time = new Date(log.timestamp).toLocaleTimeString();
-      let line = `{bold}${time}{/bold} ${log.line}`;
-      
-      if (highlight) {
-        const regex = new RegExp(`(${highlight})`, 'gi');
-        line = line.replace(regex, `{bold}${chalk.bgYellow.black('$1')}{/bold}`);
-      }
-      
-      // Color code by log level
-      if (log.line.toLowerCase().includes('error')) {
-        line = `{red-fg}${line}{/red-fg}`;
-      } else if (log.line.toLowerCase().includes('warn')) {
-        line = `{yellow-fg}${line}{/yellow-fg}`;
-      } else if (log.line.toLowerCase().includes('debug')) {
-        line = `{gray-fg}${line}{/gray-fg}`;
-      }
-      
-      logBox.addItem(line);
-    });
-    screen.render();
+  async function loadContextForIndex(idx: number) {
+    const selected = currentLogs[idx];
+    if (!selected) return;
+    setStatus('loading context…');
+    try {
+      const tsNs = Date.parse(selected.timestamp) * 1_000_000 + '';
+      const ctx = await fetchContext(currentQuery, tsNs);
+      renderContext(ctx);
+      setStatus(`context loaded: ${ctx.length} entries`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      renderContext([]);
+      setStatus(`error: ${msg}`);
+    }
   }
 
-  function renderContext(logs: LokiLogEntry[], highlight: string) {
-    contextBox.clearItems();
-    logs.forEach(log => {
-      const time = new Date(log.timestamp).toLocaleTimeString();
-      let line = `{bold}${time}{/bold} ${log.line}`;
-      
-      if (highlight) {
-        const regex = new RegExp(`(${highlight})`, 'gi');
-        line = line.replace(regex, `{bold}${chalk.bgYellow.black('$1')}{/bold}`);
-      }
-      
-      // Color code by log level
-      if (log.line.toLowerCase().includes('error')) {
-        line = `{red-fg}${line}{/red-fg}`;
-      } else if (log.line.toLowerCase().includes('warn')) {
-        line = `{yellow-fg}${line}{/yellow-fg}`;
-      } else if (log.line.toLowerCase().includes('debug')) {
-        line = `{gray-fg}${line}{/gray-fg}`;
-      }
-      
-      contextBox.addItem(line);
-    });
-    screen.render();
+  function exportLogs() {
+    const filePath = path.join(process.cwd(), `lokctl-logs-${Date.now()}.log`);
+    const content = currentLogs.map(l => `${l.timestamp} ${l.line}`).join('\n');
+    fs.writeFileSync(filePath, content, 'utf8');
+    setStatus(`logs exported to ${filePath}`);
   }
 
-  function showWriteLogForm() {
-    const form = blessed.form({
+  async function writeLogFlow() {
+    const job = await prompt('job', '');
+    if (!job) return;
+    const level = await prompt('level (info|warn|error|debug)', '');
+    if (!level) return;
+    const message = await prompt('message', '');
+    if (!message) return;
+
+    setStatus('writing log…');
+    try {
+      await writeLog(job.trim(), level.trim(), message.trim());
+      setStatus('log written, refreshing…');
+      await loadLogs();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setStatus(`error: ${msg}`);
+    }
+  }
+
+  function viewDetail(idx: number) {
+    const selected = currentLogs[idx];
+    if (!selected) return;
+    const body = `{bold}timestamp:{/bold} ${selected.timestamp}\n\n{bold}log:{/bold}\n${selected.line}`;
+    messageBox('log detail', body);
+  }
+
+  // cascading submenu popups
+  function showSubmenu(title: string, items: MenuItem[]) {
+    const list = blessed.list({
       parent: screen,
-      top: 'center',
-      left: 'center',
-      width: '60%',
-      height: '50%',
-      border: 'line',
-      label: ' Write Log Entry ',
-      keys: true,
-      mouse: true,
-      style: {
-        fg: 'white',
-        bg: 'black',
-        border: {
-          fg: 'green'
-        }
-      }
-    });
-
-    const jobLabel = blessed.text({
-      parent: form,
       top: 1,
-      left: 1,
-      content: 'Job:'
-    });
-
-    const jobInput = blessed.textbox({
-      parent: form,
-      top: 2,
-      left: 1,
-      right: 1,
-      height: 1,
-      inputOnFocus: true,
-      border: 'line',
-      style: {
-        fg: 'white',
-        bg: 'black',
-        border: {
-          fg: 'cyan'
-        },
-        focus: {
-          border: {
-            fg: 'green'
-          }
-        }
-      }
-    });
-
-    const levelLabel = blessed.text({
-      parent: form,
-      top: 4,
-      left: 1,
-      content: 'Level (info, warn, error, debug):'
-    });
-
-    const levelInput = blessed.textbox({
-      parent: form,
-      top: 5,
-      left: 1,
-      right: 1,
-      height: 1,
-      inputOnFocus: true,
-      border: 'line',
-      style: {
-        fg: 'white',
-        bg: 'black',
-        border: {
-          fg: 'cyan'
-        },
-        focus: {
-          border: {
-            fg: 'green'
-          }
-        }
-      }
-    });
-
-    const messageLabel = blessed.text({
-      parent: form,
-      top: 7,
-      left: 1,
-      content: 'Message:'
-    });
-
-    const messageInput = blessed.textbox({
-      parent: form,
-      top: 8,
-      left: 1,
-      right: 1,
-      height: 3,
-      inputOnFocus: true,
-      border: 'line',
-      multiline: true,
-      style: {
-        fg: 'white',
-        bg: 'black',
-        border: {
-          fg: 'cyan'
-        },
-        focus: {
-          border: {
-            fg: 'green'
-          }
-        }
-      }
-    });
-
-    const submitButton = blessed.button({
-      parent: form,
-      top: 12,
-      left: 1,
-      width: 12,
-      height: 1,
-      content: ' Submit ',
-      mouse: true,
+      left: 0,
+      width: 'shrink',
+      height: 'shrink',
+      label: ` ${title} `,
+      tags: true,
       keys: true,
-      style: {
-        fg: 'white',
-        bg: 'green',
-        focus: {
-          bg: 'blue'
-        }
-      }
-    });
-
-    const cancelButton = blessed.button({
-      parent: form,
-      top: 12,
-      left: 14,
-      width: 12,
-      height: 1,
-      content: ' Cancel ',
       mouse: true,
-      keys: true,
-      style: {
-        fg: 'white',
-        bg: 'red',
-        focus: {
-          bg: 'blue'
-        }
-      }
+      border: 'line',
+      style: { border: { fg: 'white' }, selected: { bg: 'blue', fg: 'white' } },
+      items: items.map(i => i.label)
     });
-
-    const statusText = blessed.text({
-      parent: form,
-      top: 14,
-      left: 1,
-      right: 1,
-      content: '',
-      style: {
-        fg: 'yellow'
-      }
-    });
-
-    form.key(['escape'], () => {
-      screen.remove(form);
-      screen.render();
-    });
-
-    cancelButton.on('press', () => {
-      screen.remove(form);
-      screen.render();
-    });
-
-    submitButton.on('press', async () => {
-      const job = jobInput.getValue().trim();
-      const level = levelInput.getValue().trim();
-      const message = messageInput.getValue().trim();
-
-      if (!job || !level || !message) {
-        statusText.setContent('All fields are required!');
-        screen.render();
-        return;
-      }
-
-      try {
-        await writeLog(job, level, message);
-        statusText.setContent('Log written successfully! Refreshing...');
-        screen.render();
-        
-        setTimeout(() => {
-          screen.remove(form);
-          updateStatus('Refreshing logs...');
-          loadLogs(currentQuery);
-        }, 1000);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        statusText.setContent(`Error: ${errorMessage}`);
-        screen.render();
-      }
-    });
-
-    jobInput.focus();
+    list.focus();
     screen.render();
+
+    const close = () => {
+      screen.remove(list);
+      screen.render();
+    };
+
+    list.on('select', async (_item, index) => {
+      const it = items[index];
+      if (!it) return close();
+      if (it.submenu) {
+        close();
+        showSubmenu(`${title}/${it.label}`, it.submenu);
+      } else if (it.action) {
+        close();
+        await it.action();
+      } else {
+        close();
+      }
+    });
+
+    list.key(['escape', 'q'], close);
   }
 
-  // Handle process signals for clean exit
-  process.on('SIGINT', () => {
+  // keys
+  screen.key(['escape', 'q', 'C-c'], () => {
     screen.destroy();
     process.exit(0);
   });
-
-  process.on('SIGTERM', () => {
-    screen.destroy();
-    process.exit(0);
+  screen.key(['r'], () => { loadLogs(); });
+  screen.key(['/'], async () => {
+    const term = await prompt('search term (highlight only)', searchTerm);
+    if (term !== null) {
+      searchTerm = term.trim();
+      renderLogs(currentLogs);
+      setStatus(searchTerm ? `highlighting "${searchTerm}"` : 'cleared highlights');
+    }
   });
+  screen.key(['c'], () => loadContextForIndex((logsBox as any).selected || 0));
+  screen.key(['v'], () => viewDetail((logsBox as any).selected || 0));
 
-  // Initialize the application
-  updateStatus('Ready - Press ? for help');
-  loadLogs(currentQuery);
+  logsBox.on('select', (_item: any, index: number) => loadContextForIndex(index));
+  logsBox.on('click', () => loadContextForIndex((logsBox as any).selected || 0));
+
+  // boot
+  setHeader();
+  setStatus('ready');
+  loadLogs();
+  screen.render();
 }
