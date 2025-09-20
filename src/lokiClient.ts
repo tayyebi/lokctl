@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { config } from './config';
+import { config } from './config.js';
 
 export interface LokiLogEntry {
   timestamp: string;
@@ -7,8 +7,16 @@ export interface LokiLogEntry {
 }
 
 export async function fetchLogs(query: string): Promise<LokiLogEntry[]> {
-  const res = await axios.get(`${config.lokiUrl}/loki/api/v1/query`, {
-    params: { query, limit: config.limit }
+  const end = Date.now() * 1e6; // Current time in nanoseconds
+  const start = end - (config.defaultRangeMinutes * 60 * 1000 * 1e6); // 10 minutes ago in nanoseconds
+  
+  const res = await axios.get(`${config.lokiUrl}/loki/api/v1/query_range`, {
+    params: { 
+      query, 
+      start: start.toString(),
+      end: end.toString(),
+      limit: config.limit 
+    }
   });
   return parseResult(res.data.data.result);
 }
@@ -26,6 +34,27 @@ export async function fetchContext(query: string, centerTs: string): Promise<Lok
     }
   });
   return parseResult(res.data.data.result);
+}
+
+export async function writeLog(job: string, level: string, message: string): Promise<void> {
+  const timestamp = Date.now() * 1_000_000; // Convert to nanoseconds
+  
+  const payload = {
+    streams: [{
+      stream: {
+        job: job,
+        level: level,
+        service: 'lokctl'
+      },
+      values: [[timestamp.toString(), message]]
+    }]
+  };
+
+  await axios.post(`${config.lokiUrl}/loki/api/v1/push`, payload, {
+    headers: {
+      'Content-Type': 'application/json'
+    }
+  });
 }
 
 function parseResult(results: any[]): LokiLogEntry[] {

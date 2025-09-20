@@ -1,2 +1,9 @@
 node_modules
 dist
+package-lock.json
+
+# Loki binaries and config
+loki
+loki-linux-amd64
+loki-linux-amd64.zip
+loki-config.yaml
